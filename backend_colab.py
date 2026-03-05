@@ -315,17 +315,20 @@ async def perform_full_analysis(patient_id: str, file_name: str):
     if not os.path.exists(path): raise HTTPException(404, "File not found")
     
     summary_path = os.path.join(DATASET_PATH, patient_id, f"{patient_id}-summary.txt")
-    ictal_range = None
+    seizure_markers = []
     if os.path.exists(summary_path):
         with open(summary_path, 'r') as f:
             content = f.read()
             if file_name in content:
                 try:
                     chunk = content.split(file_name)[1].split("File Name:")[0]
-                    if "Number of Seizures in File: 0" not in chunk:
-                        start = float(chunk.split("Start Time:")[1].split(" seconds")[0].strip())
-                        end = float(chunk.split("End Time:")[1].split(" seconds")[0].strip())
-                        ictal_range = [start, end]
+                    lines = [l.strip() for l in chunk.split('\n')]
+                    for i, line in enumerate(lines):
+                        if "Seizure" in line and "Start Time" in line:
+                            start = float(line.split(":")[1].split(" seconds")[0].strip())
+                            end_line = lines[i+1]
+                            end = float(end_line.split(":")[1].split(" seconds")[0].strip())
+                            seizure_markers.append({"start": start, "end": end})
                 except: pass
 
     f = pyedflib.EdfReader(path); labels = f.getSignalLabels()
@@ -351,8 +354,8 @@ async def perform_full_analysis(patient_id: str, file_name: str):
             "theta_alpha": [], "delta_alpha": [], "spec_entropy": [], "sef95": []
         },
         "markers": {
-            "ictal": ictal_range, 
-            "preictal": [max(0, ictal_range[0]-600), max(0, ictal_range[0]-60)] if ictal_range else None
+            "seizures": seizure_markers,
+            "preictals": [{"start": max(0, s["start"]-600), "end": max(0, s["start"]-60)} for s in seizure_markers]
         }
     }
 
@@ -433,13 +436,38 @@ async def stream_inference(patient_id: str, file_name: str):
     for i, idx in enumerate(indices): raw[i,:] = f.readSignal(idx)
     f.close()
 
+    summary_path = os.path.join(DATASET_PATH, patient_id, f"{patient_id}-summary.txt")
+    seizure_ranges = []
+    if os.path.exists(summary_path):
+        with open(summary_path, 'r') as f:
+            content = f.read()
+            if file_name in content:
+                try:
+                    chunk = content.split(file_name)[1].split("File Name:")[0]
+                    lines = [l.strip() for l in chunk.split('\n')]
+                    for i, l in enumerate(lines):
+                        if "Seizure" in l and "Start Time" in l:
+                            s = float(l.split(":")[1].split(" seconds")[0].strip())
+                            e = float(lines[i+1].split(":")[1].split(" seconds")[0].strip())
+                            seizure_ranges.append((s, e))
+                except: pass
+
     async def event_generator():
         win, strd = int(WINDOW_SEC*SFREQ), int(STRIDE_SEC*SFREQ)
         for start in range(0, raw.shape[1] - win, strd):
-            probs, state, q_mets = engine.process_window(raw[:, start:start+win])
+            t_sec = start/SFREQ
+            probs, ai_state, q_mets = engine.process_window(raw[:, start:start+win])
+            
+            # Cross-reference with summary ground truth
+            gt_state = "NORMAL"
+            for s, e in seizure_ranges:
+                if s <= t_sec <= e: gt_state = "ICTAL"; break
+                if (s-600) <= t_sec <= (s-60): gt_state = "PREICTAL"; break
+            
             payload = {
-                "time": f"{round(start/SFREQ, 1)}s", 
-                "state": state if state else "INITIALIZING", 
+                "time": f"{round(t_sec, 1)}s", 
+                "state": ai_state if ai_state else "INITIALIZING",
+                "gt_state": gt_state,
                 "wave": raw[0, start:start+win:4].tolist(),
                 "probabilities": probs,
                 "metrics": q_mets
